@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "chunk_gdn_device_operation.hpp"
+#include "chunk_gdn_phased.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -67,6 +68,7 @@ void ChunkGdnDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(attrs.chunk_size % TILE_HEIGHT == 0, "chunk_size must be a multiple of 32");
     TT_FATAL(attrs.key_dim % TILE_WIDTH == 0, "key_dim must be a multiple of 32");
     TT_FATAL(attrs.val_dim % TILE_WIDTH == 0, "val_dim must be a multiple of 32");
+    validate_gdn_tinv(attrs.tinv, attrs.chunk_size, in.q);
 
     const auto grid = in.q.device()->compute_with_storage_grid_size();
     if (attrs.impl == ChunkGdnImpl::Mono) {
@@ -400,6 +402,7 @@ std::vector<Tensor> chunk_gdn(
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const DeviceComputeKernelConfig& compute_kernel_config,
     const ChunkGdnDeviceProgramConfig& program_config,
+    ttnn::transformer::ChunkGdnWyInverse wy_inverse,
     bool v_flat,
     uint32_t HV,
     bool qk_norm,
@@ -433,6 +436,11 @@ std::vector<Tensor> chunk_gdn(
     };
     if (const auto* fused_cfg = std::get_if<ttnn::transformer::ChunkGdnFusedProgramConfig>(&program_config)) {
         attrs.impl = ChunkGdnImpl::Fused;
+        // The WY-inverse method (hashed). The geometry below is chosen with the Horner-calibrated model whatever
+        // the method: the SFPU solve removes producer compute but not the producer's DRAM/NoC time, so its gain
+        // shrinks as more producers load the NoC, and a single scale factor on w_p picked measurably slower
+        // geometries.
+        attrs.tinv = gdn_tinv_resolve(wy_inverse, chunk_size, q);
         // Geometry: the program config's pinned fields, the calibrated cost model for the rest. Resolved HERE
         // (attrs construction), never in the factory — every field is hashed, so a different config compiles a
         // fresh program instead of silently serving a stale cached one.
