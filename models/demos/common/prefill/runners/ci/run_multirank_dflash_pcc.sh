@@ -66,9 +66,13 @@ DFLASH_PCC_THRESHOLD="${PREFILL_DFLASH_PCC:-0.85}"
 #      two under it and is also the value a plain Kimi 2-galaxy run settled on. It fails on rank 1 at
 #      MLA_START of layer 0, i.e. only once tokens flow -- never at init -- so a too-large value survives
 #      weight load and warmup before killing the run.
-#   PREFILL_NUM_USERS=1    -- unlike the verifier leg's 86 on sc4: the drafter cache is allocated at
-#      max_seq_len x num_users and slot 0 is the only slot with a golden behind it, so extra slots buy no
-#      coverage. Every one of these stays overridable -- the manifest is applied with setdefault.
+#   PREFILL_NUM_USERS=69   -- the sc4 serving ceiling with the drafter cache and the trace region
+#      resident, so the leg fails on a capacity regression instead of passing at a count no deployment
+#      would run. Rank 3 sets it: it carries the drafter K+V on top of its 15 verifier layers, 398 MB
+#      per user against 294 MB elsewhere, and 70 overruns its DRAM by 0.15 MB a bank once the 256 MB
+#      trace region is carved off. It gates the allocation ceiling alone: slot 0 is the only slot with a
+#      golden behind it, so one request drives the run and the rest are allocated and idle.
+#      Every one of these stays overridable -- the manifest is applied with setdefault.
 case "${MODEL}" in
   kimi27) MANIFEST="${MANIFEST_DIR}/kimi27_dflash.json" ;;
   *)
@@ -94,6 +98,17 @@ case "${CONFIG}" in
   sc1|sc2|sc4) ;;
   *) echo "unknown config '${CONFIG}' (expected sc1, sc2 or sc4)" >&2; exit 2 ;;
 esac
+
+# The manifest count is the sc4 ceiling; every other SKU overrides it down -- sc1 puts all 61 layers on
+# one rank and holds far fewer users. The export has to be explicit: the rank shell receives a fixed
+# export list, so a value exported into this script does not reach it.
+RUNNER_NUM_USERS_EXPORT=""
+if [ "${CONFIG}" != sc4 ]; then
+  RUNNER_NUM_USERS_EXPORT="export PREFILL_NUM_USERS=1; "
+fi
+if [ -n "${PREFILL_NUM_USERS:-}" ]; then
+  RUNNER_NUM_USERS_EXPORT="export PREFILL_NUM_USERS=${PREFILL_NUM_USERS}; "
+fi
 
 # The CI descriptors are per-SKU, not per-model; sc2 has none, so fall back to the shared 2-galaxy one
 # the manual pipeline bindings already use (an 8x4 RING mesh per galaxy).
@@ -198,6 +213,7 @@ python3 "${TTRUN_PY}" \
     export PREFILL_MANIFEST='${MANIFEST}'; \
     export PREFILL_CHUNK_SIZE=${CHUNK_SIZE}; \
     export PREFILL_MAX_SEQ_LEN=${MAX_SEQ_LEN}; \
+    ${RUNNER_NUM_USERS_EXPORT}\
     export PREFILL_TIMING_DIR='${TIMING_DIR}'; \
     export PREFILL_ENABLE_MIGRATION=1; \
     export PREFILL_MOCK_MIGRATION=1; \
@@ -281,6 +297,9 @@ set +e
 # --mca btl_tcp_if_include is REQUIRED, not tuning: without it MPI_Init never completes and every rank
 # logs "applied manifest" then goes silent forever (no error). ttrun passes the same transport args to
 # the runner above, so the producer must match them or only this leg hangs.
+# The producer pins itself to one slot rather than taking the manifest count the ranks allocate for.
+# Slot 0 is the only slot with a golden behind it, so the others would replay it for an identical PCC at
+# ~26 s a slot of PCIe readback -- 30 min at the sc4 ceiling, past the leg timeout.
 "${MPIRUN}" \
   --host "${PRODUCER_HOSTS}" --map-by "rankfile:file=${RANKFILE_REL}" --bind-to none --tag-output \
   --wdir "${TT_METAL_HOME}" \
@@ -292,6 +311,7 @@ set +e
     export PREFILL_PRODUCER_MANIFEST='${MANIFEST}'; \
     export PREFILL_CHUNK_SIZE=${CHUNK_SIZE}; \
     export PREFILL_MAX_SEQ_LEN=${MAX_SEQ_LEN}; \
+    export PREFILL_NUM_USERS=1; \
     export PREFILL_PRODUCER_CHECK_PCC=1; \
     export PREFILL_PRODUCER_CHUNKS=${REAL_CHUNKS}; \
     export PREFILL_PCC_GOLDEN_LEN=${GOLDEN_LEN}; \
